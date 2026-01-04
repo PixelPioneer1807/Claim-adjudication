@@ -57,8 +57,6 @@ The system follows a modern client-server architecture:
 
 The `AdjudicationEngine` processes claims through a strict waterfall model. If a claim fails a critical step, it is rejected immediately.
 
-_(Place your logic flowchart here)_
-
 **Step-by-Step Evaluation:**
 
 1.  **Fraud Check**: Is this a duplicate claim for the same treatment date?
