@@ -1,18 +1,17 @@
 import httpx
 import base64
 import json
+import fitz 
 from typing import List, Dict, Optional
 from pathlib import Path
 import asyncio
 from .config import settings
-from .schemas import ExtractedDataSchema
 
 
 class AIService:
     """Service for interacting with OpenRouter API for document extraction and AI tasks"""
 
     def __init__(self):
-        # OpenRouter API configuration
         self.base_url = settings.AI_BASE_URL.rstrip("/")
         self.api_key = settings.AI_API_KEY
         self.model = settings.AI_MODEL
@@ -23,17 +22,48 @@ class AIService:
             "X-Title": "OPD Claim Adjudication System",
         }
         print(f"✅ AI Service initialized")
-        print(f"   Base URL: {self.base_url}")
-        print(f"   Model: {self.model}")
 
     async def extract_data_from_documents(self, document_paths: List[str]) -> Dict:
         """
-        Extract structured data from medical documents using AI vision models.
+        Extract structured data from medical documents (Images OR PDFs).
         """
-        # Convert images to base64
         base64_images = []
+
         for doc_path in document_paths:
-            if Path(doc_path).exists():
+            path_obj = Path(doc_path)
+            if not path_obj.exists():
+                continue
+
+            # ✅ LOGIC TO PROCESS PDF FILES (Using PyMuPDF)
+            if path_obj.suffix.lower() == ".pdf":
+                try:
+                    print(f"   📄 Processing PDF: {path_obj.name}")
+                    doc = fitz.open(doc_path)
+
+                    for i, page in enumerate(doc):
+                        # Render page to image (pixmap)
+                        pix = page.get_pixmap(
+                            matrix=fitz.Matrix(2, 2)
+                        )  # 2x zoom for better OCR quality
+                        img_bytes = pix.tobytes("jpeg")
+
+                        img_str = base64.standard_b64encode(img_bytes).decode("utf-8")
+                        base64_images.append(img_str)
+                        print(f"      - Converted Page {i + 1}")
+
+                    doc.close()
+
+                except Exception as e:
+                    error_msg = f"PDF Conversion Failed: {str(e)}"
+                    print(f"❌ {error_msg}")
+                    return {
+                        "extracted_data": {},
+                        "confidence_score": 0.0,
+                        "error": error_msg,
+                    }
+
+            # ✅ LOGIC FOR STANDARD IMAGES
+            else:
                 base64_img = self._encode_image_to_base64(doc_path)
                 if base64_img:
                     base64_images.append(base64_img)
@@ -42,19 +72,16 @@ class AIService:
             return {
                 "extracted_data": {},
                 "confidence_score": 0.0,
-                "error": "No valid documents found",
+                "error": "No valid documents processed",
             }
 
         try:
-            # Build messages with images
+            # Build messages
             messages = self._build_vision_messages(base64_images)
-
-            # OpenRouter endpoint
             endpoint = f"{self.base_url}/chat/completions"
 
-            print(f"\n📤 Sending request to AI API")
+            print(f"\n📤 Sending request to AI API ({len(base64_images)} pages/images)")
 
-            # Make API call
             async with httpx.AsyncClient(timeout=60.0) as client:
                 response = await client.post(
                     endpoint,
@@ -76,34 +103,20 @@ class AIService:
                 }
 
             # Parse response
-            response_data = response.json()
-            response_text = response_data["choices"][0]["message"]["content"]
+            content = response.json()["choices"][0]["message"]["content"]
+            if "```" in content:
+                content = content.replace("```json", "").replace("```", "").strip()
 
-            # Clean response text
-            response_text = response_text.strip()
-            if response_text.startswith("```json"):
-                response_text = (
-                    response_text.replace("```json", "").replace("```", "").strip()
-                )
-            elif response_text.startswith("```"):
-                response_text = response_text.replace("```", "").strip()
+            extracted_data = json.loads(content)
 
-            # Parse JSON
-            extracted_data = json.loads(response_text)
-
-            # --- VERBOSITY: PRINT THE EXTRACTED DATA ---
             print("\n" + "=" * 30)
             print("🧐 AI EXTRACTED DATA:")
             print(json.dumps(extracted_data, indent=2))
             print("=" * 30 + "\n")
-            # -------------------------------------------
-
-            # Calculate confidence
-            confidence = self._calculate_confidence(extracted_data)
 
             return {
                 "extracted_data": extracted_data,
-                "confidence_score": confidence,
+                "confidence_score": self._calculate_confidence(extracted_data),
                 "error": None,
             }
 
@@ -163,11 +176,11 @@ CRITICAL:
                 return round(float(extracted_data["extraction_confidence"]), 2)
             except:
                 pass
-        return 0.85  # Default fallback
+        return 0.85
 
     async def process_claim_with_ai(self, claim_data: Dict, policy_terms: Dict) -> Dict:
         """
-        Uses AI to check medical necessity, identifying EXCLUSIONS and Validating Standard/Alt Medicine.
+        Uses AI to check medical necessity with enhanced Context Clues.
         """
         exclusions = policy_terms.get("exclusions", [])
         alt_med = policy_terms.get("coverage_details", {}).get(
@@ -185,21 +198,25 @@ CRITICAL:
         2. ALLOWED ALTERNATIVE MEDICINE: {covered_alt}
 
         CLAIM DETAILS:
+        - Doctor Name: {claim_data.get("doctor_name")}
+        - Pre-Auth No: {claim_data.get("pre_authorization_number")}
         - Diagnosis: {claim_data.get("diagnosis")}
         - Medicines: {claim_data.get("medicines_prescribed")}
         - Procedures: {claim_data.get("procedures_performed")}
-        - Tests: {claim_data.get("diagnostic_tests")}
 
         TASK:
-        1. Check if the treatment falls under 'EXCLUSIONS' (e.g. Cosmetic).
-        2. Determine if the treatment is Standard Medical Care OR Alternative Medicine.
-        3. IF Standard (Paracetamol, Antibiotics, etc.): Verify it matches the diagnosis.
-        4. IF Alternative (Ayurveda/Homeopathy): It is ONLY valid if listed in 'ALLOWED ALTERNATIVE MEDICINE'.
+        1. Check EXCLUSIONS first.
+        2. CONTEXT CLUES:
+           - If Doctor title is 'Vaidya' or Pre-Auth contains 'AYUR', this is AYURVEDIC treatment.
+           - If Ayurvedic, check if the diagnosis generally aligns with 'Panchakarma' or similar therapies.
+        3. DECISION:
+           - If Standard Medicine: Verify matching diagnosis.
+           - If Ayurvedic (Identified via context): Mark as medically necessary if it aligns with ALLOWED ALTERNATIVE MEDICINE.
 
         Return valid JSON only:
         {{
             "is_medically_necessary": boolean,
-            "reasoning": "One short sentence explaining why. E.g. 'Standard treatment for viral fever' or 'Allowed Ayurvedic therapy'.",
+            "reasoning": "Short explanation using context clues.",
             "confidence": 0.9
         }}
         """
