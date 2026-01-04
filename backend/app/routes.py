@@ -1,7 +1,7 @@
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional
 import os
 import shutil
 from datetime import datetime
@@ -15,7 +15,9 @@ from .schemas import (
     ClaimHistorySchema,
     ErrorResponse,
 )
-from .adjudication_engine import adjudication_engine
+
+# --- CHANGED IMPORT HERE ---
+from .adjudication_engine import adjudication_engine, get_engine
 from .config import settings
 from .utils import sanitize_filename
 
@@ -30,6 +32,7 @@ async def submit_claim(
     member_id: str = Form(...),
     member_name: str = Form(...),
     treatment_date: str = Form(...),
+    member_join_date: Optional[str] = Form(None),
     documents: List[UploadFile] = File(...),
     db: Session = Depends(get_db),
 ):
@@ -40,6 +43,7 @@ async def submit_claim(
         member_id: Member ID
         member_name: Member name
         treatment_date: Treatment date (YYYY-MM-DD)
+        member_join_date: Optional member join date for waiting period checks
         documents: List of medical document files
         db: Database session
 
@@ -50,6 +54,8 @@ async def submit_claim(
     print(f"📋 New Claim Submission")
     print(f"   Member: {member_name} ({member_id})")
     print(f"   Treatment Date: {treatment_date}")
+    if member_join_date:
+        print(f"   Join Date: {member_join_date}")
     print(f"   Documents: {len(documents)}")
     print(f"{'=' * 60}\n")
 
@@ -86,17 +92,23 @@ async def submit_claim(
 
         # Create claim submission object
         claim_submission = ClaimSubmissionSchema(
-            member_id=member_id, member_name=member_name, treatment_date=treatment_date
+            member_id=member_id,
+            member_name=member_name,
+            treatment_date=treatment_date,
+            member_join_date=member_join_date,
         )
 
-        # Process claim through adjudication engine
-        if adjudication_engine is None:
+        # --- FIX: Fetch engine using getter ---
+        engine_instance = get_engine()
+
+        if engine_instance is None:
             raise HTTPException(
                 status_code=500, detail="Adjudication engine not initialized"
             )
 
-        result = await adjudication_engine.process_claim(
-            claim_submission, document_paths
+        # Process claim through adjudication engine with DB session
+        result = await engine_instance.process_claim(
+            claim_submission, document_paths, db
         )
 
         # Save to database

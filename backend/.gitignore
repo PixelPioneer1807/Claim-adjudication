@@ -1,2 +1,4 @@
 .env
 venv/
+
+generated_test_docs/

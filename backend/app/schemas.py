@@ -5,18 +5,44 @@ from enum import Enum
 
 
 class RejectionReason(str, Enum):
-    """Enumeration of possible rejection reasons"""
+    """Enumeration of possible rejection reasons based on adjudication rules"""
 
+    # Eligibility & Policy
+    POLICY_INACTIVE = "Policy not active"
+    WAITING_PERIOD = "Waiting period not satisfied"
+    MEMBER_NOT_COVERED = "Member not covered"
+
+    # Documentation
     INCOMPLETE_INFORMATION = "Incomplete information in documents"
     INVALID_DOCUMENTS = "Invalid or unreadable documents"
     INVALID_PRESCRIPTION = "Invalid prescription or doctor registration"
-    INVALID_DATE = "Invalid treatment date"
-    CLAIM_PERIOD_EXPIRED = "Claim period expired (beyond 90 days)"
-    INVALID_AMOUNT = "Invalid claim amount"
-    PER_CLAIM_EXCEEDED = "Amount exceeds per-claim limit"
+    DOCTOR_REG_INVALID = "Doctor registration invalid/missing"
+    DATE_MISMATCH = "Document dates do not match"
+    PATIENT_MISMATCH = "Patient details do not match"
+
+    # Coverage
+    SERVICE_NOT_COVERED = "Service not covered"
+    EXCLUDED_CONDITION = "Condition excluded"
     PRE_EXISTING_CONDITION = "Pre-existing condition not covered"
+    PRE_AUTH_MISSING = "Pre-authorization missing"
     NON_COVERED_PROCEDURE = "Non-covered procedure"
+
+    # Limits
+    ANNUAL_LIMIT_EXCEEDED = "Annual limit exceeded"
+    SUB_LIMIT_EXCEEDED = "Sub-limit exceeded"
+    PER_CLAIM_EXCEEDED = "Amount exceeds per-claim limit"
+    INVALID_AMOUNT = "Invalid claim amount"
+
+    # Medical
     NOT_MEDICALLY_NECESSARY = "Not medically necessary"
+    EXPERIMENTAL_TREATMENT = "Experimental treatment"
+    COSMETIC_PROCEDURE = "Cosmetic procedure"
+
+    # Process
+    LATE_SUBMISSION = "Late submission"
+    CLAIM_PERIOD_EXPIRED = "Claim period expired (beyond 90 days)"
+    DUPLICATE_CLAIM = "Duplicate claim"
+    INVALID_DATE = "Invalid treatment date"
     SYSTEM_ERROR = "System error during processing"
 
 
@@ -26,6 +52,10 @@ class ClaimSubmissionSchema(BaseModel):
     member_id: str = Field(..., description="Member ID")
     member_name: str = Field(..., description="Member name")
     treatment_date: str = Field(..., description="Treatment date in YYYY-MM-DD format")
+    # NEW: Required for calculating waiting periods (e.g., Diabetes 90 days)
+    member_join_date: Optional[str] = Field(
+        None, description="Member join date (YYYY-MM-DD)"
+    )
 
     class Config:
         json_schema_extra = {
@@ -33,6 +63,7 @@ class ClaimSubmissionSchema(BaseModel):
                 "member_id": "EMP001",
                 "member_name": "John Doe",
                 "treatment_date": "2024-01-15",
+                "member_join_date": "2023-01-01",
             }
         }
 

@@ -1,427 +1,376 @@
 import asyncio
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+import difflib
+
 from .ai_service import ai_service
-from .utils import (
-    validate_doctor_registration,
-    calculate_age_from_dob,
-    is_within_date_range,
-)
+from .models import Claim
+from .utils import validate_doctor_registration
 from .schemas import ClaimSubmissionSchema, AdjudicationResultSchema, RejectionReason
 
 
 class AdjudicationEngine:
-    """
-    Core engine for automated claim adjudication.
-    Processes claims using AI for document extraction and rule-based validation.
-    """
+    """Core engine for automated claim adjudication."""
 
     def __init__(self, policy_terms: Dict):
-        """
-        Initialize the adjudication engine with policy terms.
-
-        Args:
-            policy_terms: Dictionary containing policy rules and limits
-        """
         self.policy = policy_terms
-        print(f"✅ Adjudication Engine initialized")
-        print(f"   Policy: {policy_terms.get('policy_name', 'Unknown')}")
+        print(f"✅ Adjudication Engine initialized: {policy_terms.get('policy_name')}")
 
     async def process_claim(
-        self, claim_submission: ClaimSubmissionSchema, document_paths: List[str]
+        self,
+        claim_submission: ClaimSubmissionSchema,
+        document_paths: List[str],
+        db: Session,
     ) -> AdjudicationResultSchema:
-        """
-        Process a claim submission through the complete adjudication pipeline.
-
-        Steps:
-        1. Extract data from documents using AI
-        2. Validate extracted data
-        3. Apply policy rules
-        4. Calculate approved amount and deductions
-        5. Generate decision with reasoning
-
-        Args:
-            claim_submission: Submitted claim data
-            document_paths: List of uploaded document file paths
-
-        Returns:
-            AdjudicationResultSchema with decision and details
-        """
-        print(f"\n{'=' * 60}")
-        print(f"🔍 Processing Claim for {claim_submission.member_name}")
-        print(f"{'=' * 60}\n")
+        print(f"\n🔍 Processing Claim: {claim_submission.member_name}")
 
         try:
-            # Step 1: Extract data from documents using AI
-            print("📄 Step 1: Extracting data from documents...")
-            extraction_result = await ai_service.extract_data_from_documents(
-                document_paths
-            )
+            # 1. FRAUD CHECK (Same Day Claims)
+            if self._check_fraud_indicators(claim_submission, db):
+                return self._create_rejection_result(
+                    claim_submission,
+                    [RejectionReason.DUPLICATE_CLAIM],
+                    "Potential Fraud: Multiple claims submitted for same treatment date.",
+                )
 
-            if extraction_result.get("error"):
-                print(f"❌ Extraction failed: {extraction_result['error']}")
+            # 2. Extract Data
+            extraction = await ai_service.extract_data_from_documents(document_paths)
+            if extraction.get("error"):
                 return self._create_rejection_result(
                     claim_submission,
                     [RejectionReason.INVALID_DOCUMENTS],
-                    f"Document extraction failed: {extraction_result['error']}",
+                    extraction["error"],
                 )
 
-            extracted_data = extraction_result.get("extracted_data", {})
-            confidence_score = extraction_result.get("confidence_score", 0.0)
+            data = extraction["extracted_data"]
+            confidence = extraction["confidence_score"]
 
-            print(f"✅ Data extracted (confidence: {confidence_score:.2f})")
+            # 3. Eligibility (Waiting Period)
+            eligibility = self._check_eligibility(claim_submission, data)
+            if not eligibility["is_eligible"]:
+                return self._create_rejection_result(
+                    claim_submission, eligibility["reasons"], eligibility["notes"]
+                )
 
-            # Step 2: Validate extracted data
-            print("\n✓ Step 2: Validating extracted data...")
-            validation_result = self._validate_extracted_data(extracted_data)
-
-            if not validation_result["is_valid"]:
-                print(f"❌ Validation failed: {validation_result['reasons']}")
+            # 4. Validation (Identity Check + Docs)
+            validation = self._validate_extracted_data(data, claim_submission)
+            if not validation["is_valid"]:
                 return self._create_rejection_result(
                     claim_submission,
-                    validation_result["reasons"],
-                    f"Validation failed: {', '.join([r.value for r in validation_result['reasons']])}",
+                    validation["reasons"],
+                    "; ".join([r.value for r in validation["reasons"]]),
                 )
 
-            print(f"✅ Validation passed")
-
-            # Step 3: Check policy coverage
-            print("\n🔍 Step 3: Checking policy coverage...")
-            coverage_result = self._check_policy_coverage(extracted_data)
-
-            if not coverage_result["is_covered"]:
-                print(f"❌ Not covered: {coverage_result['reasons']}")
-                return self._create_rejection_result(
-                    claim_submission,
-                    coverage_result["reasons"],
-                    f"Not covered: {', '.join([r.value for r in coverage_result['reasons']])}",
-                )
-
-            print(f"✅ Coverage confirmed")
-
-            # Step 4: Check medical necessity (using AI)
-            print("\n🤖 Step 4: Checking medical necessity with AI...")
-            ai_assessment = await ai_service.process_claim_with_ai(
-                extracted_data, self.policy
+            # 5. Coverage & Limits (Pre-auth + Annual Limit)
+            coverage = self._check_policy_coverage_and_limits(
+                data, claim_submission.member_id, db
             )
 
-            if not ai_assessment.get("is_medically_necessary", True):
-                print(f"❌ Not medically necessary: {ai_assessment.get('reasoning')}")
+            # If rejected due to LIMITS, we might want to consider Partial Approval later
+            # But for now, if it's an EXCLUSION or PRE-AUTH missing, we reject hard.
+            # If it's just a LIMIT exceeded, we will try to cap it in calculation step.
+            if not coverage["is_covered"]:
+                # Check if the only reason is LIMIT EXCEEDED
+                only_limits = all(
+                    r
+                    in [
+                        RejectionReason.PER_CLAIM_EXCEEDED,
+                        RejectionReason.ANNUAL_LIMIT_EXCEEDED,
+                    ]
+                    for r in coverage["reasons"]
+                )
+
+                if not only_limits:
+                    # It has hard rejections (Exclusions/Pre-auth), so we reject.
+                    return self._create_rejection_result(
+                        claim_submission,
+                        coverage["reasons"],
+                        "; ".join([r.value for r in coverage["reasons"]]),
+                    )
+                else:
+                    print(
+                        "   ⚠️ Limit exceeded, but proceeding to Calculate for Partial Approval cap."
+                    )
+
+            # 6. Medical Necessity
+            ai_assess = await ai_service.process_claim_with_ai(data, self.policy)
+            if not ai_assess.get("is_medically_necessary", True):
                 return self._create_rejection_result(
                     claim_submission,
                     [RejectionReason.NOT_MEDICALLY_NECESSARY],
-                    ai_assessment.get("reasoning", "Not medically necessary"),
+                    ai_assess.get("reasoning", ""),
                 )
 
-            print(f"✅ Medical necessity confirmed")
+            # 7. Calculate
+            # Pass coverage reasons so we can cap the amount if needed
+            calc = self._calculate_approved_amount(data, coverage["reasons"])
 
-            # Step 5: Calculate approved amount
-            print("\n💰 Step 5: Calculating approved amount...")
-            calculation_result = self._calculate_approved_amount(extracted_data)
-
-            approved_amount = calculation_result["approved_amount"]
-            deductions = calculation_result["deductions"]
-
-            print(f"✅ Approved amount: ₹{approved_amount}")
-            print(f"   Deductions: {deductions}")
-
-            # Step 6: Generate final decision
-            print("\n✅ Step 6: Generating final decision...")
+            # 8. Decide
             decision = self._determine_final_decision(
-                approved_amount, confidence_score, validation_result, ai_assessment
+                calc["approved_amount"], confidence, validation, ai_assess, calc
             )
 
-            print(f"✅ Final decision: {decision}")
-
-            # Create result
-            result = AdjudicationResultSchema(
+            return AdjudicationResultSchema(
                 claim_id=self._generate_claim_id(),
                 decision=decision,
-                approved_amount=approved_amount,
-                confidence_score=confidence_score,
-                deductions=deductions,
+                approved_amount=calc["approved_amount"],
+                confidence_score=confidence,
+                deductions=calc["deductions"],
                 notes=self._generate_notes(
-                    extracted_data, calculation_result, ai_assessment
+                    data, calc, ai_assess, eligibility, coverage
                 ),
                 next_steps=self._generate_next_steps(decision),
-                rejection_reasons=None,
-                rejected_items=calculation_result.get("rejected_items", []),
+                rejected_items=calc["rejected_items"],
             )
 
-            print(f"\n{'=' * 60}")
-            print(f"✅ Claim Processing Complete")
-            print(f"   Decision: {decision}")
-            print(f"   Approved: ₹{approved_amount}")
-            print(f"{'=' * 60}\n")
-
-            return result
-
         except Exception as e:
-            print(f"❌ Claim processing error: {str(e)}")
             import traceback
 
             traceback.print_exc()
-
             return self._create_rejection_result(
-                claim_submission,
-                [RejectionReason.SYSTEM_ERROR],
-                f"System error during processing: {str(e)}",
+                claim_submission, [RejectionReason.SYSTEM_ERROR], str(e)
             )
 
-    def _validate_extracted_data(self, data: Dict) -> Dict:
-        """
-        Validate extracted data for completeness and correctness.
+    # --- HELPER FUNCTIONS ---
 
-        Returns:
-            Dict with is_valid flag and list of rejection reasons
-        """
+    def _safe_get_lower(self, data: Dict, key: str) -> str:
+        """Safely get string from dict and lower() it, handling None/Null."""
+        val = data.get(key)
+        if val is None:
+            return ""
+        return str(val).lower()
+
+    def _check_fraud_indicators(
+        self, submission: ClaimSubmissionSchema, db: Session
+    ) -> bool:
+        same_day_claims = (
+            db.query(Claim)
+            .filter(
+                Claim.member_id == submission.member_id,
+                Claim.treatment_date == submission.treatment_date,
+            )
+            .count()
+        )
+        if same_day_claims >= 2:
+            print(f"   ⚠️ FRAUD ALERT: {same_day_claims} previous claims found")
+            return True
+        return False
+
+    def _check_eligibility(self, submission: ClaimSubmissionSchema, data: Dict) -> Dict:
+        reasons = []
+        notes = []
+
+        if not submission.member_join_date:
+            return {"is_eligible": True, "reasons": [], "notes": ""}
+
+        try:
+            join = datetime.strptime(submission.member_join_date, "%Y-%m-%d")
+            treat = datetime.strptime(submission.treatment_date, "%Y-%m-%d")
+            days_active = (treat - join).days
+
+            if days_active < 0:
+                return {
+                    "is_eligible": False,
+                    "reasons": [RejectionReason.POLICY_INACTIVE],
+                    "notes": "Inactive policy",
+                }
+
+            # FIX: Use safe getter
+            diagnosis = self._safe_get_lower(data, "diagnosis")
+            waiting = self.policy.get("waiting_periods", {})
+
+            if days_active < waiting.get("initial_waiting", 30):
+                reasons.append(RejectionReason.WAITING_PERIOD)
+                notes.append(f"In initial waiting period (Day {days_active})")
+
+            for ailment, days in waiting.get("specific_ailments", {}).items():
+                if ailment in diagnosis and days_active < days:
+                    reasons.append(RejectionReason.WAITING_PERIOD)
+                    notes.append(f"{ailment.title()} waiting period not met")
+
+        except ValueError:
+            pass
+
+        return {
+            "is_eligible": len(reasons) == 0,
+            "reasons": reasons,
+            "notes": "; ".join(notes),
+        }
+
+    def _validate_extracted_data(
+        self, data: Dict, submission: ClaimSubmissionSchema
+    ) -> Dict:
         reasons = []
 
-        # Check for required fields
-        required_fields = [
-            "patient_name",
-            "doctor_name",
-            "treatment_date",
-            "total_amount",
-        ]
-        missing_fields = [field for field in required_fields if not data.get(field)]
-
-        if missing_fields:
-            reasons.append(RejectionReason.INCOMPLETE_INFORMATION)
-            print(f"   ⚠️ Missing fields: {missing_fields}")
-
-        # Validate doctor registration
-        doctor_reg = data.get("doctor_registration")
-        if doctor_reg and not validate_doctor_registration(doctor_reg):
-            reasons.append(RejectionReason.INVALID_PRESCRIPTION)
-            print(f"   ⚠️ Invalid doctor registration: {doctor_reg}")
-        elif not doctor_reg:
-            reasons.append(RejectionReason.INVALID_PRESCRIPTION)
-            print(f"   ⚠️ Doctor registration missing")
-
-        # Validate treatment date (not in future, within coverage period)
-        treatment_date_str = data.get("treatment_date")
-        if treatment_date_str:
-            try:
-                treatment_date = datetime.strptime(treatment_date_str, "%Y-%m-%d")
-                if treatment_date > datetime.now():
-                    reasons.append(RejectionReason.INVALID_DATE)
-                    print(f"   ⚠️ Treatment date in future")
-
-                # Check if within coverage period (last 90 days)
-                if not is_within_date_range(treatment_date, days=90):
-                    reasons.append(RejectionReason.CLAIM_PERIOD_EXPIRED)
-                    print(f"   ⚠️ Treatment date outside coverage period")
-            except ValueError:
-                reasons.append(RejectionReason.INVALID_DATE)
-                print(f"   ⚠️ Invalid date format: {treatment_date_str}")
-
-        # Validate total amount
-        total_amount = data.get("total_amount")
-        if not total_amount or total_amount <= 0:
+        # FIX: Handle None in amount
+        amount = data.get("total_amount")
+        if amount is None or amount <= 0:
             reasons.append(RejectionReason.INVALID_AMOUNT)
-            print(f"   ⚠️ Invalid total amount: {total_amount}")
+
+        # Identity Check
+        doc_name = self._safe_get_lower(data, "patient_name")
+        sub_name = submission.member_name.lower()
+
+        if doc_name and sub_name:
+            ratio = difflib.SequenceMatcher(None, doc_name, sub_name).ratio()
+            if ratio < 0.6:
+                print(
+                    f"   ⚠️ Identity Mismatch: '{doc_name}' vs '{sub_name}' (Ratio: {ratio:.2f})"
+                )
+                reasons.append(RejectionReason.PATIENT_MISMATCH)
 
         return {"is_valid": len(reasons) == 0, "reasons": reasons}
 
-    def _check_policy_coverage(self, data: Dict) -> Dict:
-        """
-        Check if claim meets policy coverage requirements.
-
-        Returns:
-            Dict with is_covered flag and list of rejection reasons
-        """
+    def _check_policy_coverage_and_limits(
+        self, data: Dict, member_id: str, db: Session
+    ) -> Dict:
         reasons = []
+        amount = data.get("total_amount", 0) or 0  # Handle None
 
-        # Check per-claim limit
-        total_amount = data.get("total_amount", 0)
-        per_claim_limit = self.policy.get("coverage_limits", {}).get(
-            "per_claim_limit", 5000
-        )
-
-        if total_amount > per_claim_limit:
+        # 1. Per Claim Limit
+        if amount > self.policy["coverage_details"]["per_claim_limit"]:
             reasons.append(RejectionReason.PER_CLAIM_EXCEEDED)
-            print(
-                f"   ⚠️ Amount ₹{total_amount} exceeds per-claim limit ₹{per_claim_limit}"
-            )
 
-        # Check if diagnosis is covered
-        diagnosis = data.get("diagnosis", "").lower()
-        excluded_conditions = self.policy.get("exclusions", {}).get(
-            "pre_existing_conditions", []
+        # 2. Annual Limit
+        past_total = (
+            db.query(func.sum(Claim.approved_amount))
+            .filter(Claim.member_id == member_id, Claim.decision == "APPROVED")
+            .scalar()
+            or 0
         )
 
-        for excluded in excluded_conditions:
-            if excluded.lower() in diagnosis:
-                reasons.append(RejectionReason.PRE_EXISTING_CONDITION)
-                print(f"   ⚠️ Pre-existing condition: {excluded}")
-                break
+        if (past_total + amount) > self.policy["coverage_details"]["annual_limit"]:
+            reasons.append(RejectionReason.ANNUAL_LIMIT_EXCEEDED)
 
-        # Check if procedures are covered
-        procedures = data.get("procedures_performed", [])
-        excluded_procedures = self.policy.get("exclusions", {}).get(
-            "non_covered_procedures", []
+        # 3. Exclusions
+        diagnosis = self._safe_get_lower(data, "diagnosis")
+        for excl in self.policy.get("exclusions", []):
+            if excl.lower() in diagnosis:
+                reasons.append(RejectionReason.EXCLUDED_CONDITION)
+
+        # 4. Pre-Authorization (MRI/CT)
+        # Handle None in lists
+        tests = data.get("diagnostic_tests") or []
+        procedures = data.get("procedures_performed") or []
+        combined_services = str(tests) + str(procedures) + diagnosis
+
+        needs_pre_auth = (
+            "MRI" in combined_services.upper() or "CT SCAN" in combined_services.upper()
         )
+        has_pre_auth = data.get("pre_authorization_number") is not None
 
-        for procedure in procedures:
-            if any(excl.lower() in procedure.lower() for excl in excluded_procedures):
-                reasons.append(RejectionReason.NON_COVERED_PROCEDURE)
-                print(f"   ⚠️ Non-covered procedure: {procedure}")
-                break
+        if needs_pre_auth and not has_pre_auth:
+            if amount > 5000:
+                reasons.append(RejectionReason.PRE_AUTH_MISSING)
 
         return {"is_covered": len(reasons) == 0, "reasons": reasons}
 
-    def _calculate_approved_amount(self, data: Dict) -> Dict:
-        """
-        Calculate approved amount with deductions.
-
-        Returns:
-            Dict with approved_amount, deductions, and rejected_items
-        """
-        total_amount = data.get("total_amount", 0)
+    def _calculate_approved_amount(
+        self, data: Dict, coverage_reasons: List[str] = []
+    ) -> Dict:
+        total = data.get("total_amount", 0) or 0
         deductions = {}
-        rejected_items = []
 
-        # Apply copayment
-        copay_percentage = self.policy.get("deductibles_copay", {}).get(
-            "copay_percentage", 10
-        )
-        copay_amount = total_amount * (copay_percentage / 100)
-        deductions["copay"] = round(copay_amount, 2)
+        # CAP AMOUNT if Limit Exceeded
+        per_claim_limit = self.policy["coverage_details"]["per_claim_limit"]
 
-        # Apply deductible
-        deductible = self.policy.get("deductibles_copay", {}).get("deductible", 0)
-        if deductible > 0:
-            deductions["deductible"] = deductible
+        capped_amount = total
+        if RejectionReason.PER_CLAIM_EXCEEDED in coverage_reasons:
+            print(f"   ⚠️ Capping claim at limit: {per_claim_limit}")
+            deductions["limit_cap"] = round(total - per_claim_limit, 2)
+            capped_amount = per_claim_limit
 
-        # Check medicine coverage (50% for non-generic)
-        medicines = data.get("medicines_prescribed", [])
-        if medicines:
-            # Simple check: if medicine name contains "Brand" or is capitalized, consider non-generic
-            non_generic_medicines = [
-                med
-                for med in medicines
-                if isinstance(med, dict) and med.get("name", "").istitle()
-            ]
+        # Network Discount
+        hospital = self._safe_get_lower(data, "clinic_hospital_name")
+        network_hospitals = self.policy.get("network_hospitals", [])
+        is_network = any(h.lower() in hospital for h in network_hospitals)
 
-            if non_generic_medicines:
-                medicine_charges = data.get("medicine_charges", 0)
-                non_generic_penalty = medicine_charges * 0.5
-                deductions["non_generic_medicines"] = round(non_generic_penalty, 2)
-                rejected_items.extend(
-                    [med.get("name", "") for med in non_generic_medicines]
-                )
+        net_amount = capped_amount
+        if is_network:
+            disc = capped_amount * 0.20  # 20% discount
+            deductions["network_discount"] = round(disc, 2)
+            net_amount -= disc
 
-        # Calculate final approved amount
-        total_deductions = sum(deductions.values())
-        approved_amount = max(0, total_amount - total_deductions)
+        # Copay
+        copay = net_amount * 0.10
+        deductions["copay"] = round(copay, 2)
 
+        approved = max(0, net_amount - copay)
         return {
-            "approved_amount": round(approved_amount, 2),
+            "approved_amount": round(approved, 2),
             "deductions": deductions,
-            "rejected_items": rejected_items,
+            "rejected_items": [],
+            "is_network": is_network,
         }
 
-    def _determine_final_decision(
-        self,
-        approved_amount: float,
-        confidence_score: float,
-        validation_result: Dict,
-        ai_assessment: Dict,
-    ) -> str:
-        """
-        Determine final decision based on all factors.
-
-        Returns:
-            One of: APPROVED, REJECTED, PARTIAL, MANUAL_REVIEW
-        """
-        # If confidence is low, send for manual review
-        if confidence_score < 0.7:
+    def _determine_final_decision(self, amount, confidence, val, ai, calc) -> str:
+        if confidence < 0.7 or ai.get("confidence", 1) < 0.6:
             return "MANUAL_REVIEW"
-
-        # If AI confidence in medical necessity is low
-        ai_confidence = ai_assessment.get("confidence", 1.0)
-        if ai_confidence < 0.6:
-            return "MANUAL_REVIEW"
-
-        # If approved amount is 0, reject
-        if approved_amount <= 0:
+        if amount <= 0:
             return "REJECTED"
 
-        # If there are rejected items, it's partial approval
-        # This would be checked in the calculation result
+        # If we applied a "limit_cap", that counts as PARTIAL approval
+        if "limit_cap" in calc.get("deductions", {}):
+            return "PARTIAL"
 
-        # Otherwise, approve
+        if calc.get("rejected_items"):
+            return "PARTIAL"
         return "APPROVED"
 
-    def _generate_notes(
-        self, extracted_data: Dict, calculation_result: Dict, ai_assessment: Dict
-    ) -> str:
-        """Generate human-readable notes about the decision."""
+    def _generate_notes(self, data, calc, ai, elig, cov) -> str:
         notes = []
+        if elig.get("notes"):
+            notes.append(elig["notes"])
+        if cov.get("reasons"):
+            # Only show reasons that didn't stop approval (like Limit Exceeded -> Partial)
+            pass
+        if calc.get("is_network"):
+            notes.append("Network Hospital")
+        if ai.get("reasoning"):
+            notes.append(ai["reasoning"])
 
-        # Add diagnosis info
-        diagnosis = extracted_data.get("diagnosis")
-        if diagnosis:
-            notes.append(f"Diagnosis: {diagnosis}")
+        # Explain deductions
+        for k, v in calc.get("deductions", {}).items():
+            notes.append(f"{k.replace('_', ' ').title()}: -₹{v}")
 
-        # Add deduction info
-        deductions = calculation_result.get("deductions", {})
-        if deductions:
-            deduction_str = ", ".join([f"{k}: ₹{v}" for k, v in deductions.items()])
-            notes.append(f"Deductions applied: {deduction_str}")
+        return " | ".join(filter(None, notes))
 
-        # Add AI reasoning
-        ai_reasoning = ai_assessment.get("reasoning")
-        if ai_reasoning:
-            notes.append(f"AI Assessment: {ai_reasoning}")
+    def _generate_next_steps(self, decision) -> str:
+        if decision == "APPROVED" or decision == "PARTIAL":
+            return "Payment processed within 3 days."
+        return "Contact Support"
 
-        return " | ".join(notes) if notes else "Claim processed successfully"
-
-    def _generate_next_steps(self, decision: str) -> str:
-        """Generate next steps based on decision."""
-        next_steps_map = {
-            "APPROVED": "Your claim has been approved. Amount will be credited within 3-5 business days.",
-            "REJECTED": "Please review the rejection reasons and submit a new claim with correct documentation if applicable.",
-            "PARTIAL": "Partial approval granted. Some items were excluded. You may appeal for the excluded items.",
-            "MANUAL_REVIEW": "Your claim requires manual review. Our team will contact you within 2 business days.",
-        }
-        return next_steps_map.get(
-            decision, "Please contact customer support for more information."
-        )
-
-    def _create_rejection_result(
-        self,
-        claim_submission: ClaimSubmissionSchema,
-        reasons: List[RejectionReason],
-        notes: str,
-    ) -> AdjudicationResultSchema:
-        """Create a rejection result."""
+    def _create_rejection_result(self, sub, reasons, notes) -> AdjudicationResultSchema:
         return AdjudicationResultSchema(
             claim_id=self._generate_claim_id(),
             decision="REJECTED",
             approved_amount=0.0,
-            confidence_score=0.0,
+            confidence_score=1.0,
             rejection_reasons=reasons,
             notes=notes,
-            next_steps=self._generate_next_steps("REJECTED"),
+            next_steps="Contact Support",
         )
 
     def _generate_claim_id(self) -> str:
-        """Generate unique claim ID."""
         import uuid
 
-        timestamp = datetime.now().strftime("%Y%m%d")
-        unique_id = str(uuid.uuid4())[:8]
-        return f"CLM-{timestamp}-{unique_id.upper()}"
+        return (
+            f"CLM-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:6].upper()}"
+        )
 
 
-# Singleton instance will be created when policy is loaded
+# Global & Getter
 adjudication_engine = None
 
 
 def initialize_engine(policy_terms: Dict):
-    """Initialize the global adjudication engine instance."""
     global adjudication_engine
     adjudication_engine = AdjudicationEngine(policy_terms)
+    return adjudication_engine
+
+
+def get_engine():
+    global adjudication_engine
     return adjudication_engine
