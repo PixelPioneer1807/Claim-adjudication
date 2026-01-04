@@ -108,12 +108,14 @@ pip install -r requirements.txt
 # Configure Environment
 cp .env.example .env
 # Edit .env and add your AI_API_KEY
+```
 
 ## 🚀 Getting Started
 
 ### 1. Backend Setup
 
 Run the server:
+
 ```bash
 python main.py
 # Server starts at http://localhost:8000
