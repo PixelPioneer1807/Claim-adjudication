@@ -1,11 +1,11 @@
 # 🏥 OPD Claim Adjudication System
 
-
 An AI-powered automation tool built for the **Plum AI Automation Engineer Intern Assignment**. This system automates the end-to-end adjudication process for Outpatient Department (OPD) insurance claims, combining deterministic policy rules with Large Language Models (LLMs) for document understanding.
 
 ---
 
 ## 📋 Table of Contents
+
 - [Overview](#-overview)
 - [Architecture](#-architecture)
 - [Features](#-features)
@@ -20,6 +20,7 @@ An AI-powered automation tool built for the **Plum AI Automation Engineer Intern
 ## 🚀 Overview
 
 The **OPD Claim Adjudication Tool** streamlines the manual review of insurance claims. Users upload medical documents (bills, prescriptions), and the system:
+
 1.  **Extracts Data**: Uses Vision LLMs to read handwritten and printed text.
 2.  **Validates Policy**: Checks waiting periods, sub-limits, and exclusions.
 3.  **Detects Fraud**: Flags duplicate claims or suspicious patterns.
@@ -31,9 +32,10 @@ The **OPD Claim Adjudication Tool** streamlines the manual review of insurance c
 
 The system follows a modern client-server architecture:
 
-*(Place your architecture diagram here. Suggested flow: React UI -> FastAPI Server -> Adjudication Engine -> AI Service -> LLM Provider)*
+![Architecture Diagram](./architecture.png)
 
 ### Core Components:
+
 1.  **Frontend**: React + Vite application for claim submission and result visualization.
 2.  **Backend API**: FastAPI service managing uploads, database transactions, and routing.
 3.  **Adjudication Engine**: The brain of the system (`adjudication_engine.py`). It orchestrates the validation waterfall.
@@ -55,9 +57,10 @@ The system follows a modern client-server architecture:
 
 The `AdjudicationEngine` processes claims through a strict waterfall model. If a claim fails a critical step, it is rejected immediately.
 
-*(Place your logic flowchart here)*
+_(Place your logic flowchart here)_
 
 **Step-by-Step Evaluation:**
+
 1.  **Fraud Check**: Is this a duplicate claim for the same treatment date?
 2.  **AI Extraction**: Extract Member Name, Diagnosis, Procedures, and Amounts.
 3.  **Eligibility**: Is the policy active? Is the **Waiting Period** served?
@@ -74,6 +77,7 @@ The `AdjudicationEngine` processes claims through a strict waterfall model. If a
 ## 🛠 Tech Stack
 
 ### Backend
+
 - **Framework**: FastAPI (Python)
 - **Database**: SQLite (via SQLAlchemy)
 - **PDF Processing**: PyMuPDF (`fitz`)
@@ -81,6 +85,7 @@ The `AdjudicationEngine` processes claims through a strict waterfall model. If a
 - **AI Integration**: HTTPX (Async) connecting to LLM APIs
 
 ### Frontend
+
 - **Framework**: React.js (Vite)
 - **Styling**: Tailwind CSS
 - **State Management**: React Hooks
@@ -90,11 +95,13 @@ The `AdjudicationEngine` processes claims through a strict waterfall model. If a
 ## ⚡ Setup & Installation
 
 ### Prerequisites
+
 - Node.js (v16+)
 - Python (v3.9+)
 - API Key for LLM (OpenAI/OpenRouter)
 
 ### 1. Backend Setup
+
 ```bash
 cd backend
 
@@ -122,6 +129,7 @@ python main.py
 ```
 
 ### 2. Frontend Setup
+
 ```bash
 cd frontend
 
@@ -142,10 +150,11 @@ npm run dev
 Submits a new claim for adjudication.
 
 **Form Data:**
-* `member_id` (string)
-* `member_name` (string)
-* `treatment_date` (YYYY-MM-DD)
-* `documents` (List[File])
+
+- `member_id` (string)
+- `member_name` (string)
+- `treatment_date` (YYYY-MM-DD)
+- `documents` (List[File])
 
 **Response:** Returns `AdjudicationResult` with decision, approved amount, and reasoning.
 
