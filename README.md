@@ -181,8 +181,5 @@ Retrieves detailed breakdown of a specific claim.
 
 ---
 
-## Assignmnt Video
-![Assignment Video](./Assignment_video.mp4)
-
 
 Built with ❤️ for Plum.
