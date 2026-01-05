@@ -1,7 +1,7 @@
 import httpx
 import base64
 import json
-import fitz 
+import fitz
 from typing import List, Dict, Optional
 from pathlib import Path
 import asyncio
@@ -190,34 +190,45 @@ CRITICAL:
             alt_med.get("covered_treatments", []) if alt_med.get("covered") else []
         )
 
+        # ---------------------------------------------------------
+        # UPDATED PROMPT: Removed doctor dependency, Fixed Partial Logic
+        # ---------------------------------------------------------
         prompt = f"""
-        You are an expert Insurance Adjudicator. Review this claim against the policy rules.
+        You are an expert Insurance Adjudicator. Validate the medical necessity of this claim.
 
-        POLICY CONTEXT:
-        1. EXCLUSIONS (Reject these): {exclusions}
-        2. ALLOWED ALTERNATIVE MEDICINE: {covered_alt}
+        --- POLICY RULES ---
+        1. STRICT EXCLUSIONS: {exclusions}
+           (Note: "Teeth Whitening" is Cosmetic. "Obesity" is Weight Loss.) > EXAMPLES, USE THEM AS INSPIRATION.
+        2. ALTERNATIVE MEDICINE:
+           - Allowed: {covered_alt}
+           - VALIDATION: Check the TREATMENT/PROCEDURE name (e.g., Panchakarma, Sirodhara, Homeopathy).
+           - Do NOT check the Doctor's name or title. If the treatment is listed above, it is covered.
 
-        CLAIM DETAILS:
-        - Doctor Name: {claim_data.get("doctor_name")}
-        - Pre-Auth No: {claim_data.get("pre_authorization_number")}
-        - Diagnosis: {claim_data.get("diagnosis")}
-        - Medicines: {claim_data.get("medicines_prescribed")}
-        - Procedures: {claim_data.get("procedures_performed")}
+        --- CLAIM DATA ---
+        - Diagnosis: "{claim_data.get("diagnosis", "Unknown")}"
+        - Medicines: {claim_data.get("medicines_prescribed", [])}
+        - Procedures: {claim_data.get("procedures_performed", [])}
 
-        TASK:
-        1. Check EXCLUSIONS first.
-        2. CONTEXT CLUES:
-           - If Doctor title is 'Vaidya' or Pre-Auth contains 'AYUR', this is AYURVEDIC treatment.
-           - If Ayurvedic, check if the diagnosis generally aligns with 'Panchakarma' or similar therapies.
-        3. DECISION:
-           - If Standard Medicine: Verify matching diagnosis.
-           - If Ayurvedic (Identified via context): Mark as medically necessary if it aligns with ALLOWED ALTERNATIVE MEDICINE.
+        --- ANALYSIS STEPS ---
+        1. IDENTIFY SYSTEM: 
+           - Is the *Procedure* or *Medicine* Allopathic or Alternative? 
+           - Example: "Panchakarma" -> Alternative. "Root Canal" -> Allopathic.
+        
+        2. CHECK PARTIAL APPROVAL (Crucial): 
+           - If the claim has ONE valid item (e.g. Root Canal) and ONE excluded item (e.g. Teeth Whitening), it is PARTIAL APPROVAL.
+           - In this case, `is_medically_necessary` must be TRUE (because the valid part is necessary).
+           - List the invalid part in `excluded_items`.
+        
+        3. CHECK NECESSITY:
+           - Does the valid treatment match the diagnosis?
 
-        Return valid JSON only:
+        --- OUTPUT ---
+        Return a single valid JSON object:
         {{
             "is_medically_necessary": boolean,
-            "reasoning": "Short explanation using context clues.",
-            "confidence": 0.9
+            "reasoning": "Concise reasoning. Explicitly state if Partial Approval is recommended.",
+            "confidence": 0.95,
+            "excluded_items": ["List only the strictly excluded items here"]
         }}
         """
 
@@ -247,6 +258,7 @@ CRITICAL:
             "is_medically_necessary": True,
             "reasoning": "Standard protocol (AI Check Skipped)",
             "confidence": 0.9,
+            "excluded_items": [],
         }
 
 

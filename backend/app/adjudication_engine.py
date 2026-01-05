@@ -68,11 +68,7 @@ class AdjudicationEngine:
                 data, claim_submission.member_id, db
             )
 
-            # If rejected due to LIMITS, we might want to consider Partial Approval later
-            # But for now, if it's an EXCLUSION or PRE-AUTH missing, we reject hard.
-            # If it's just a LIMIT exceeded, we will try to cap it in calculation step.
             if not coverage["is_covered"]:
-                # Check if the only reason is LIMIT EXCEEDED
                 only_limits = all(
                     r
                     in [
@@ -83,7 +79,6 @@ class AdjudicationEngine:
                 )
 
                 if not only_limits:
-                    # It has hard rejections (Exclusions/Pre-auth), so we reject.
                     return self._create_rejection_result(
                         claim_submission,
                         coverage["reasons"],
@@ -96,7 +91,12 @@ class AdjudicationEngine:
 
             # 6. Medical Necessity
             ai_assess = await ai_service.process_claim_with_ai(data, self.policy)
-            if not ai_assess.get("is_medically_necessary", True):
+
+            # If AI says NOT necessary AND has no excluded items, it's a full rejection
+            # If it has excluded items, we treat it as Partial (handled in step 7)
+            excluded_items = ai_assess.get("excluded_items", [])
+
+            if not ai_assess.get("is_medically_necessary", True) and not excluded_items:
                 return self._create_rejection_result(
                     claim_submission,
                     [RejectionReason.NOT_MEDICALLY_NECESSARY],
@@ -104,8 +104,10 @@ class AdjudicationEngine:
                 )
 
             # 7. Calculate
-            # Pass coverage reasons so we can cap the amount if needed
-            calc = self._calculate_approved_amount(data, coverage["reasons"])
+            # Pass coverage reasons AND AI excluded items
+            calc = self._calculate_approved_amount(
+                data, coverage["reasons"], excluded_items
+            )
 
             # 8. Decide
             decision = self._determine_final_decision(
@@ -117,6 +119,9 @@ class AdjudicationEngine:
                 decision=decision,
                 approved_amount=calc["approved_amount"],
                 confidence_score=confidence,
+                rejection_reasons=coverage["reasons"]
+                if decision == "REJECTED"
+                else None,
                 deductions=calc["deductions"],
                 notes=self._generate_notes(
                     data, calc, ai_assess, eligibility, coverage
@@ -177,7 +182,6 @@ class AdjudicationEngine:
                     "notes": "Inactive policy",
                 }
 
-            # FIX: Use safe getter
             diagnosis = self._safe_get_lower(data, "diagnosis")
             waiting = self.policy.get("waiting_periods", {})
 
@@ -204,12 +208,10 @@ class AdjudicationEngine:
     ) -> Dict:
         reasons = []
 
-        # FIX: Handle None in amount
         amount = data.get("total_amount")
         if amount is None or amount <= 0:
             reasons.append(RejectionReason.INVALID_AMOUNT)
 
-        # Identity Check
         doc_name = self._safe_get_lower(data, "patient_name")
         sub_name = submission.member_name.lower()
 
@@ -227,7 +229,7 @@ class AdjudicationEngine:
         self, data: Dict, member_id: str, db: Session
     ) -> Dict:
         reasons = []
-        amount = data.get("total_amount", 0) or 0  # Handle None
+        amount = data.get("total_amount", 0) or 0
 
         # 1. Per Claim Limit
         if amount > self.policy["coverage_details"]["per_claim_limit"]:
@@ -251,7 +253,6 @@ class AdjudicationEngine:
                 reasons.append(RejectionReason.EXCLUDED_CONDITION)
 
         # 4. Pre-Authorization (MRI/CT)
-        # Handle None in lists
         tests = data.get("diagnostic_tests") or []
         procedures = data.get("procedures_performed") or []
         combined_services = str(tests) + str(procedures) + diagnosis
@@ -268,28 +269,38 @@ class AdjudicationEngine:
         return {"is_covered": len(reasons) == 0, "reasons": reasons}
 
     def _calculate_approved_amount(
-        self, data: Dict, coverage_reasons: List[str] = []
+        self,
+        data: Dict,
+        coverage_reasons: List[str] = [],
+        excluded_items: List[str] = [],
     ) -> Dict:
         total = data.get("total_amount", 0) or 0
         deductions = {}
 
+        # Deduct Excluded Items (Estimate if exact cost unknown)
+        # Note: In a real system, we'd need line-item extraction.
+        # Here, if we have excluded items but don't know the cost, we can't be precise.
+        # But if the 'total' seems high, we might assume partial deduction.
+        # For this assignment, we will just pass the rejected items list for display.
+
+        current_amount = total
+
         # CAP AMOUNT if Limit Exceeded
         per_claim_limit = self.policy["coverage_details"]["per_claim_limit"]
 
-        capped_amount = total
         if RejectionReason.PER_CLAIM_EXCEEDED in coverage_reasons:
             print(f"   ⚠️ Capping claim at limit: {per_claim_limit}")
-            deductions["limit_cap"] = round(total - per_claim_limit, 2)
-            capped_amount = per_claim_limit
+            deductions["limit_cap"] = round(current_amount - per_claim_limit, 2)
+            current_amount = per_claim_limit
 
         # Network Discount
         hospital = self._safe_get_lower(data, "clinic_hospital_name")
         network_hospitals = self.policy.get("network_hospitals", [])
         is_network = any(h.lower() in hospital for h in network_hospitals)
 
-        net_amount = capped_amount
+        net_amount = current_amount
         if is_network:
-            disc = capped_amount * 0.20  # 20% discount
+            disc = current_amount * 0.20  # 20% discount
             deductions["network_discount"] = round(disc, 2)
             net_amount -= disc
 
@@ -298,16 +309,23 @@ class AdjudicationEngine:
         deductions["copay"] = round(copay, 2)
 
         approved = max(0, net_amount - copay)
+
+        # If we have excluded items but approved > 0, it's Partial.
+        # If the excluded item was the *only* thing, approved would likely be 0 if we had line items.
+
         return {
             "approved_amount": round(approved, 2),
             "deductions": deductions,
-            "rejected_items": [],
+            "rejected_items": excluded_items,
             "is_network": is_network,
         }
 
     def _determine_final_decision(self, amount, confidence, val, ai, calc) -> str:
+        # If confidence is low, MANUAL REVIEW
         if confidence < 0.7 or ai.get("confidence", 1) < 0.6:
             return "MANUAL_REVIEW"
+
+        # If amount is 0, REJECTED
         if amount <= 0:
             return "REJECTED"
 
@@ -315,8 +333,10 @@ class AdjudicationEngine:
         if "limit_cap" in calc.get("deductions", {}):
             return "PARTIAL"
 
+        # If we have specific rejected items (from AI), it's PARTIAL
         if calc.get("rejected_items"):
             return "PARTIAL"
+
         return "APPROVED"
 
     def _generate_notes(self, data, calc, ai, elig, cov) -> str:
@@ -324,14 +344,12 @@ class AdjudicationEngine:
         if elig.get("notes"):
             notes.append(elig["notes"])
         if cov.get("reasons"):
-            # Only show reasons that didn't stop approval (like Limit Exceeded -> Partial)
             pass
         if calc.get("is_network"):
             notes.append("Network Hospital")
         if ai.get("reasoning"):
             notes.append(ai["reasoning"])
 
-        # Explain deductions
         for k, v in calc.get("deductions", {}).items():
             notes.append(f"{k.replace('_', ' ').title()}: -₹{v}")
 
