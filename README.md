@@ -141,6 +141,13 @@ npm run dev
 
 ---
 
+## Important Notes
+- Ensure the AI API key is valid and has sufficient quota for document processing.
+- I'v added detailed verbosity so that you can check logs for each adjudication step in the backend console.[Vrify the extration and decision-making process.]
+- The sample policy terms are in `policy_terms.json`. Modify as needed for testing different scenarios.
+
+---
+
 ## 📡 API Documentation
 
 ### `POST /api/v1/claims/submit`
